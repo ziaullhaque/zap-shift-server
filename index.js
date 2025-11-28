@@ -67,6 +67,7 @@ async function run() {
     const parcelsCollection = db.collection("parcels");
     const paymentCollection = db.collection("payments");
     const ridersCollection = db.collection("riders");
+    const trackingsCollection = db.collection("trackings");
 
     // middle admin before allowing admin activity
     // must be used after verifyFBToken middleware
@@ -75,9 +76,20 @@ async function run() {
       const query = { email };
       const user = await usersCollection.findOne(query);
       if (!user || user.role !== "admin") {
-        return res.status(403).send({ message: "Forbidden access" });
+        return res.status(403).send({ message: "Forbidden admin access" });
       }
       next();
+    };
+
+    const logTracking = async (trackingId, status) => {
+      const log = {
+        trackingId,
+        status,
+        details: status.split("_").join(" "),
+        createdAt: new Date(),
+      };
+      const result = await trackingsCollection.insertOne(log);
+      return result;
     };
 
     //  users related apis
@@ -96,7 +108,10 @@ async function run() {
         ];
       }
 
-      const cursor = usersCollection.find(query).limit(6);
+      const cursor = usersCollection
+        .find(query)
+        .sort({ createdAt: -1 })
+        .limit(6);
       const result = await cursor.toArray();
       res.send(result);
     });
@@ -114,29 +129,14 @@ async function run() {
     //     res.send({ role: user?.role || "user" });
     //   }
     // );
-    app.get("/zap_users/:email/role", verifyFBToken, async (req, res) => {
+
+    // app.get("/zap_users/:email/role", verifyFBToken, async (req, res) => {
+    app.get("/zap_users/:email/role", async (req, res) => {
       const email = req.params.email;
-      const user = await usersCollection.findOne({ email });
+      const query = { email };
+      const user = await usersCollection.findOne(query);
       res.send({ role: user?.role || "user" });
     });
-
-    app.patch(
-      "/zap_users/:id/role",
-      verifyFBToken,
-      verifyAdmin,
-      async (req, res) => {
-        const id = req.params.id;
-        const roleInfo = req.body;
-        const query = { _id: new ObjectId(id) };
-        const updateDoc = {
-          $set: {
-            role: roleInfo.role,
-          },
-        };
-        const result = await usersCollection.updateOne(query, updateDoc);
-        res.send(result);
-      }
-    );
 
     //  users related apis
     app.post("/zap_users", async (req, res) => {
@@ -169,6 +169,24 @@ async function run() {
       res.send(result);
     });
 
+    app.patch(
+      "/zap_users/:id/role",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        const id = req.params.id;
+        const roleInfo = req.body;
+        const query = { _id: new ObjectId(id) };
+        const updateDoc = {
+          $set: {
+            role: roleInfo.role,
+          },
+        };
+        const result = await usersCollection.updateOne(query, updateDoc);
+        res.send(result);
+      }
+    );
+
     //  parcel api
     app.get("/parcels", async (req, res) => {
       const query = {};
@@ -186,6 +204,29 @@ async function run() {
       res.send(result);
     });
 
+    app.get("/parcels/rider", async (req, res) => {
+      const { riderEmail, deliveryStatus } = req.query;
+      const query = {};
+      if (riderEmail) {
+        query.riderEmail = riderEmail;
+      }
+      // if (deliveryStatus) {
+      //   query.deliveryStatus = { $in: ["driver_assigned", "rider_arriving"] };
+      // }
+      //
+      // if (deliveryStatus) {
+      //   query.deliveryStatus = { $nin: ["parcel_delivered"] };
+      // }
+      if (deliveryStatus !== "parcel_delivered") {
+        query.deliveryStatus = { $nin: ["parcel_delivered"] };
+      } else {
+        query.deliveryStatus = deliveryStatus;
+      }
+      const cursor = parcelsCollection.find(query);
+      const result = await cursor.toArray();
+      res.send(result);
+    });
+
     app.get("/parcels/:id", async (req, res) => {
       const id = req.params.id;
       const query = { _id: new ObjectId(id) };
@@ -195,12 +236,28 @@ async function run() {
 
     app.post("/parcels", async (req, res) => {
       const parcel = req.body;
+
+      // generate tracking id
+      const trackingId = generateTrackingId();
+
       // parcel created time
-      parcel.createAt = new Date();
+      // set created time and tracking id
+      parcel.createdAt = new Date();
+      parcel.trackingId = trackingId;
+
+      // logTracking(trackingId, "parcel_created");
+      logTracking(trackingId, "parcel_created");
       const result = await parcelsCollection.insertOne(parcel);
+      res.send({
+        success: true,
+        trackingId,
+        inserted: result,
+      });
     });
+
+    // TODO : rename this to be specific like /parcels/:id/assign
     app.patch("/parcels/:id", async (req, res) => {
-      const { riderId, riderName, riderEmail } = req.body;
+      const { riderId, riderName, riderEmail, trackingId } = req.body;
       const id = req.params.id;
       const query = { _id: new ObjectId(id) };
 
@@ -224,7 +281,37 @@ async function run() {
         riderQuery,
         riderUpdatedDoc
       );
+      // log tracking
+      logTracking(trackingId, "driver_assigned");
       res.send(riderResult);
+    });
+
+    app.patch("/parcels/:id/status", async (req, res) => {
+      const { deliveryStatus, riderId, trackingId } = req.body;
+      const query = { _id: new ObjectId(req.params.id) };
+      const updatedDoc = {
+        $set: {
+          deliveryStatus: deliveryStatus,
+        },
+      };
+
+      if (deliveryStatus === "parcel_delivered") {
+        // update rider information
+        const riderQuery = { _id: new ObjectId(riderId) };
+        const riderUpdatedDoc = {
+          $set: {
+            workStatus: "available",
+          },
+        };
+        const riderResult = await ridersCollection.updateOne(
+          riderQuery,
+          riderUpdatedDoc
+        );
+      }
+      const result = await parcelsCollection.updateOne(query, updatedDoc);
+      // log tracking
+      logTracking(trackingId, deliveryStatus);
+      res.send(result);
     });
 
     app.delete("/parcels/:id", async (req, res) => {
@@ -254,6 +341,7 @@ async function run() {
         mode: "payment",
         metadata: {
           parcelId: paymentInfo.parcelId,
+          trackingId: paymentInfo.trackingId,
         },
         customer_email: paymentInfo.senderEmail,
         success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
@@ -263,35 +351,35 @@ async function run() {
     });
 
     // payment related APIs( old 63-5 )
-    app.post("/create-checkout-session", async (req, res) => {
-      const paymentInfo = req.body;
-      const amount = parseInt(paymentInfo.cost) * 100;
-      const session = await stripe.checkout.sessions.create({
-        line_items: [
-          {
-            price_data: {
-              currency: "USD",
-              unit_amount: amount,
-              product_data: {
-                name: paymentInfo.parcelName,
-              },
-            },
-            quantity: 1,
-          },
-        ],
-        customer_email: paymentInfo.senderEmail,
-        mode: "payment",
-        metadata: {
-          parcelId: paymentInfo.parcelId,
-          parcelName: paymentInfo.parcelName,
-        },
-        // success_url: `${process.env.SITE_DOMAIN}?success=true`,
-        success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success`,
-        cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-cancelled`,
-      });
-      console.log(session);
-      res.send({ url: session.url });
-    });
+    // app.post("/create-checkout-session", async (req, res) => {
+    //   const paymentInfo = req.body;
+    //   const amount = parseInt(paymentInfo.cost) * 100;
+    //   const session = await stripe.checkout.sessions.create({
+    //     line_items: [
+    //       {
+    //         price_data: {
+    //           currency: "USD",
+    //           unit_amount: amount,
+    //           product_data: {
+    //             name: paymentInfo.parcelName,
+    //           },
+    //         },
+    //         quantity: 1,
+    //       },
+    //     ],
+    //     customer_email: paymentInfo.senderEmail,
+    //     mode: "payment",
+    //     metadata: {
+    //       parcelId: paymentInfo.parcelId,
+    //       parcelName: paymentInfo.parcelName,
+    //     },
+    //     // success_url: `${process.env.SITE_DOMAIN}?success=true`,
+    //     success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success`,
+    //     cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-cancelled`,
+    //   });
+    //   console.log(session);
+    //   res.send({ url: session.url });
+    // });
 
     app.patch("/payment-success", async (req, res) => {
       const sessionId = req.query.session_id;
@@ -313,8 +401,11 @@ async function run() {
       console.log("Session id", sessionId);
       console.log("Session retrieve", session);
 
+      // use the previous tracking id created during the parcel create which was set to the session metadata during session creation
+      const trackingId = session.metadata.trackingId;
+
       // FIX: trackingId variable
-      const trackingId = generateTrackingId();
+      // const trackingId = generateTrackingId();
 
       if (session.payment_status === "paid") {
         const id = session.metadata.parcelId;
@@ -323,7 +414,7 @@ async function run() {
           $set: {
             paymentStatus: "paid",
             deliveryStatus: "pending-pickup",
-            trackingId: trackingId,
+            // trackingId: trackingId,
           },
         };
 
@@ -340,16 +431,19 @@ async function run() {
           paidAt: new Date(),
           trackingId: trackingId,
         };
+        if (session.payment_status === "paid") {
+          const resultPayment = await paymentCollection.insertOne(payment);
+          logTracking(trackingId, "parcel_paid");
+          // logTracking(trackingId, "parcel_paid");
 
-        const resultPayment = await paymentCollection.insertOne(payment);
-
-        return res.send({
-          success: true,
-          modifyParcel: result,
-          trackingId: trackingId,
-          paymentInfo: resultPayment,
-          transactionId: session.payment_intent,
-        });
+          res.send({
+            success: true,
+            modifyParcel: result,
+            trackingId: trackingId,
+            paymentInfo: resultPayment,
+            transactionId: session.payment_intent,
+          });
+        }
       }
 
       return res.send({ success: false });
@@ -429,6 +523,14 @@ async function run() {
           updateUser
         );
       }
+      res.send(result);
+    });
+
+    // tracking related apis
+    app.get("/trackings/:trackingId/logs", async (req, res) => {
+      const trackingId = req.params.trackingId;
+      const query = { trackingId };
+      const result = await trackingsCollection.find(query).toArray();
       res.send(result);
     });
 
